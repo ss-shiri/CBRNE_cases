@@ -1,6 +1,6 @@
 import datetime
 import json
-import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -73,7 +73,12 @@ def get_week_stamp(now: datetime.datetime) -> tuple[str, str]:
 
 def load_manifest() -> list[dict[str, Any]]:
     if MANIFEST_PATH.exists():
-        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except json.JSONDecodeError:
+            return []
     return []
 
 
@@ -85,20 +90,22 @@ def save_manifest(entries: list[dict[str, Any]]) -> None:
     )
 
 
-def archive_previous_issue(manifest: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Moves current week's live files into archive/ if they exist and aren't archived yet."""
+def archive_previous_issue(
+    manifest: list[dict[str, Any]], current_case_id: str
+) -> list[dict[str, Any]]:
     if not INDEX_EN.exists():
         return manifest
 
-    first_line = INDEX_EN.read_text(encoding="utf-8")
-    # Extract current case ID from <title>CASE-YYYY-Www — ...
-    if "<title>CASE-" not in first_line:
+    html_text = INDEX_EN.read_text(encoding="utf-8")
+    match = re.search(r"<title>(CASE-\d{4}-W\d{2})\s+—\s+(.*?)</title>", html_text)
+    if not match:
         return manifest
 
-    title_start = first_line.index("<title>CASE-") + len("<title>")
-    title_end = first_line.index("</title>", title_start)
-    prev_title_tag = first_line[title_start:title_end]
-    prev_case_id = prev_title_tag.split(" — ", 1)[0].strip()
+    prev_case_id = match.group(1).strip()
+    title_en = match.group(2).strip()
+
+    if prev_case_id == current_case_id:
+        return manifest
 
     if any(entry.get("case_id") == prev_case_id for entry in manifest):
         return manifest
@@ -110,17 +117,12 @@ def archive_previous_issue(manifest: list[dict[str, Any]]) -> list[dict[str, Any
     native_archive_name: str | None = None
     native_code = "native"
     native_label = "NATIVE"
-    title_en = prev_title_tag.split(" — ", 1)[-1].strip()
-    country = "International"
-    category = "CBRNE"
-    date_range = prev_case_id
 
     if INDEX_NATIVE.exists():
         native_html = INDEX_NATIVE.read_text(encoding="utf-8")
-        if 'lang="' in native_html:
-            c_start = native_html.index('lang="') + len('lang="')
-            c_end = native_html.index('"', c_start)
-            native_code = native_html[c_start:c_end].strip() or "native"
+        lang_match = re.search(r'<html[^>]*\blang="([^"]+)"', native_html)
+        if lang_match:
+            native_code = lang_match.group(1).strip() or "native"
         native_archive_name = f"{prev_case_id.lower()}-{native_code}.html"
         shutil.copy2(INDEX_NATIVE, ARCHIVE_DIR / native_archive_name)
 
@@ -128,9 +130,9 @@ def archive_previous_issue(manifest: list[dict[str, Any]]) -> list[dict[str, Any
         0,
         {
             "case_id": prev_case_id,
-            "date_range": date_range,
-            "category": category,
-            "country": country,
+            "date_range": prev_case_id,
+            "category": "CBRNE",
+            "country": "International",
             "title_en": title_en,
             "en_file": en_archive_name,
             "native_file": native_archive_name,
@@ -138,6 +140,14 @@ def archive_previous_issue(manifest: list[dict[str, Any]]) -> list[dict[str, Any
         },
     )
     return manifest
+
+
+def parse_json_safely(raw_text: str) -> dict[str, Any]:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return json.loads(cleaned)
 
 
 def generate_cbrne_payload(case_id: str, date_range: str) -> dict[str, Any]:
@@ -319,7 +329,10 @@ Task:
         ),
     )
 
-    data = json.loads(response.text)
+    if not response.text:
+        raise RuntimeError("Gemini returned an empty response.")
+
+    data = parse_json_safely(response.text)
     data["case_id"] = case_id
     data["date_range"] = date_range
     return data
@@ -381,7 +394,6 @@ def render_pages(payload: dict[str, Any], manifest: list[dict[str, Any]]) -> Non
     )
     INDEX_NATIVE.write_text(native_html, encoding="utf-8")
 
-    # Update manifest metadata for current case so archive index reflects accurate info
     updated_manifest = [
         entry for entry in manifest if entry.get("case_id") != payload["case_id"]
     ]
@@ -402,7 +414,7 @@ def main() -> None:
     case_id, date_range = get_week_stamp(now)
 
     manifest = load_manifest()
-    manifest = archive_previous_issue(manifest)
+    manifest = archive_previous_issue(manifest, case_id)
 
     payload = generate_cbrne_payload(case_id, date_range)
     render_pages(payload, manifest)
